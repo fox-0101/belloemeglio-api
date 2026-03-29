@@ -80,19 +80,77 @@ async function publishPreview(slug, azienda) {
     }
   }
 
-  // Step 2: Add domain
+  // Step 1b: Verify git integration is linked
+  const projCheck = await vercelAPI(`/v9/projects/${projectId}`);
+  const gitLink = projCheck.data?.link;
+  if (!gitLink || !gitLink.repo) {
+    steps.push({ step: "git_check", status: "no_git_integration", message: "Project has no linked Git repo — deploy will never trigger" });
+    // Attempt to link the repo
+    const linkRes = await vercelAPI(`/v9/projects/${projectId}/link`, "POST", {
+      type: "github",
+      repo: `${GITHUB_ORG}/${slug}`,
+      productionBranch: "main",
+    });
+    if (linkRes.status === 200 || linkRes.status === 201) {
+      steps.push({ step: "git_link", status: "linked", repo: `${GITHUB_ORG}/${slug}` });
+    } else {
+      steps.push({ step: "git_link", status: "failed", http: linkRes.status, details: linkRes.data });
+      return { ok: false, error: `Git integration failed: cannot link ${GITHUB_ORG}/${slug}`, slug, steps };
+    }
+  } else {
+    steps.push({ step: "git_check", status: "ok", repo: gitLink.repo });
+  }
+
+  // Step 2: Add domain (bloccante — senza dominio il sito non è raggiungibile)
   const domRes = await vercelAPI(`/v10/projects/${projectId}/domains`, "POST", { name: domain });
   if (domRes.status === 200 || domRes.status === 201) {
     steps.push({ step: "domain", status: "added", domain });
   } else if (domRes.status === 409) {
     steps.push({ step: "domain", status: "already_configured", domain });
   } else {
-    steps.push({ step: "domain", status: "warning", http: domRes.status, details: domRes.data });
+    steps.push({ step: "domain", status: "failed", http: domRes.status, details: domRes.data });
+    return { ok: false, error: `Domain setup failed: ${domRes.status}`, slug, domain, steps };
   }
 
-  // Step 3: Wait for deploy (max 90s)
+  // Step 3: Create deploy hook + trigger build
+  // Vercel non triggera un deploy automatico se il repo è collegato dopo i commit.
+  // Usiamo un deploy hook per forzare il primo build.
+  let deployHookUrl = null;
+  const hookRes = await vercelAPI(`/v1/integrations/deploy-hooks`, "POST", {
+    projectId,
+    name: "belloemeglio-auto",
+    ref: "main",
+  });
+  if (hookRes.status === 200 || hookRes.status === 201) {
+    const hookId = hookRes.data?.id;
+    deployHookUrl = `https://api.vercel.com/v1/integrations/deploy/${projectId}/${hookId}`;
+    steps.push({ step: "deploy_hook", status: "created", hookId });
+  } else {
+    // Se il hook esiste già, proviamo a listare i hook esistenti
+    const listHooks = await vercelAPI(`/v1/integrations/deploy-hooks?projectId=${projectId}`);
+    const existing = listHooks.data?.[0];
+    if (existing) {
+      deployHookUrl = `https://api.vercel.com/v1/integrations/deploy/${projectId}/${existing.id}`;
+      steps.push({ step: "deploy_hook", status: "reused_existing", hookId: existing.id });
+    } else {
+      steps.push({ step: "deploy_hook", status: "failed", http: hookRes.status, details: hookRes.data });
+    }
+  }
+
+  // Trigger il deploy via hook (GET request)
+  if (deployHookUrl) {
+    const triggerRes = await fetch(deployHookUrl);
+    const triggerData = await triggerRes.json().catch(() => ({}));
+    if (triggerData?.job) {
+      steps.push({ step: "deploy_trigger", status: "triggered", jobId: triggerData.job.id });
+    } else {
+      steps.push({ step: "deploy_trigger", status: "warning", http: triggerRes.status, details: triggerData });
+    }
+  }
+
+  // Step 4: Wait for deploy to be READY (max 120s)
   let deployReady = false;
-  for (let i = 0; i < 9; i++) {
+  for (let i = 0; i < 12; i++) {
     const deps = await vercelAPI(`/v6/deployments?projectId=${projectId}&limit=1`);
     const dep = deps.data?.deployments?.[0];
     if (dep && (dep.readyState === "READY" || dep.state === "READY")) {
@@ -100,10 +158,27 @@ async function publishPreview(slug, azienda) {
       steps.push({ step: "deploy", status: "ready", url: dep.url });
       break;
     }
+    const state = dep?.readyState || dep?.state || "no_deployment";
+    if (i === 0) steps.push({ step: "deploy_wait", status: "polling", currentState: state });
     await sleep(10000);
   }
   if (!deployReady) {
-    steps.push({ step: "deploy", status: "pending", message: "Not ready after 90s, check later" });
+    steps.push({ step: "deploy", status: "pending", message: "Not ready after 120s, check later" });
+  }
+
+  // Se il deploy non è pronto, è un fallimento — Relay NON deve aggiornare Notion
+  if (!deployReady) {
+    return {
+      ok: false,
+      error: "Deploy not ready after 120s — no deployment found. Check Vercel git integration.",
+      preview_url: `https://${domain}`,
+      slug,
+      azienda,
+      project_id: projectId,
+      domain,
+      deploy_ready: false,
+      steps,
+    };
   }
 
   return {
@@ -113,7 +188,7 @@ async function publishPreview(slug, azienda) {
     azienda,
     project_id: projectId,
     domain,
-    deploy_ready: deployReady,
+    deploy_ready: true,
     steps,
   };
 }
