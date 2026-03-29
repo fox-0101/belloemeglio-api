@@ -112,40 +112,85 @@ async function publishPreview(slug, azienda) {
     return { ok: false, error: `Domain setup failed: ${domRes.status}`, slug, domain, steps };
   }
 
-  // Step 3: Create deploy hook + trigger build
-  // Vercel non triggera un deploy automatico se il repo è collegato dopo i commit.
-  // Usiamo un deploy hook per forzare il primo build.
-  let deployHookUrl = null;
-  const hookRes = await vercelAPI(`/v1/integrations/deploy-hooks`, "POST", {
-    projectId,
-    name: "belloemeglio-auto",
-    ref: "main",
-  });
-  if (hookRes.status === 200 || hookRes.status === 201) {
-    const hookId = hookRes.data?.id;
-    deployHookUrl = `https://api.vercel.com/v1/integrations/deploy/${projectId}/${hookId}`;
-    steps.push({ step: "deploy_hook", status: "created", hookId });
+  // Step 3: Trigger build via Vercel Deployments API (più affidabile dei deploy hooks)
+  // Metodo primario: POST /v13/deployments con gitSource
+  let deployTriggered = false;
+
+  // Metodo 1: Vercel Create Deployment API (diretto, affidabile)
+  const deployBody = {
+    name: slug,
+    project: projectId,
+    target: "production",
+    gitSource: {
+      type: "github",
+      org: GITHUB_ORG,
+      repo: slug,
+      ref: "main",
+    },
+  };
+  console.log(`[DEPLOY] Triggering deployment via POST /v13/deployments for ${slug}...`);
+  const deployRes = await vercelAPI("/v13/deployments", "POST", deployBody);
+  if (deployRes.status === 200 || deployRes.status === 201) {
+    deployTriggered = true;
+    steps.push({
+      step: "deploy_trigger",
+      status: "triggered_via_api",
+      deploymentId: deployRes.data?.id,
+      url: deployRes.data?.url,
+    });
+    console.log(`[DEPLOY] ✅ Deployment created: ${deployRes.data?.id} — ${deployRes.data?.url}`);
   } else {
-    // Se il hook esiste già, proviamo a listare i hook esistenti
-    const listHooks = await vercelAPI(`/v1/integrations/deploy-hooks?projectId=${projectId}`);
-    const existing = listHooks.data?.[0];
-    if (existing) {
-      deployHookUrl = `https://api.vercel.com/v1/integrations/deploy/${projectId}/${existing.id}`;
-      steps.push({ step: "deploy_hook", status: "reused_existing", hookId: existing.id });
+    steps.push({
+      step: "deploy_trigger_api",
+      status: "failed",
+      http: deployRes.status,
+      details: deployRes.data,
+    });
+    console.log(`[DEPLOY] ⚠️ API deploy failed (${deployRes.status}), trying deploy hook fallback...`);
+
+    // Metodo 2 (fallback): Deploy hook
+    let deployHookUrl = null;
+    const hookRes = await vercelAPI(`/v1/integrations/deploy-hooks`, "POST", {
+      projectId,
+      name: "belloemeglio-auto",
+      ref: "main",
+    });
+    if (hookRes.status === 200 || hookRes.status === 201) {
+      // Usa la URL dalla response (include il secret)
+      deployHookUrl = hookRes.data?.url;
+      if (!deployHookUrl) {
+        // Fallback: costruisci URL con id
+        deployHookUrl = `https://api.vercel.com/v1/integrations/deploy/${hookRes.data?.id}`;
+      }
+      steps.push({ step: "deploy_hook", status: "created", hookId: hookRes.data?.id });
     } else {
-      steps.push({ step: "deploy_hook", status: "failed", http: hookRes.status, details: hookRes.data });
+      const listHooks = await vercelAPI(`/v1/integrations/deploy-hooks?projectId=${projectId}`);
+      const existing = Array.isArray(listHooks.data) ? listHooks.data[0] : null;
+      if (existing) {
+        deployHookUrl = existing.url || `https://api.vercel.com/v1/integrations/deploy/${existing.id}`;
+        steps.push({ step: "deploy_hook", status: "reused_existing", hookId: existing.id });
+      } else {
+        steps.push({ step: "deploy_hook", status: "failed", http: hookRes.status, details: hookRes.data });
+      }
+    }
+
+    if (deployHookUrl) {
+      // Deploy hooks si triggerano con POST (non GET)
+      const triggerRes = await fetch(deployHookUrl, { method: "POST" });
+      const triggerData = await triggerRes.json().catch(() => ({}));
+      if (triggerRes.status < 300 && (triggerData?.job || triggerData?.id)) {
+        deployTriggered = true;
+        steps.push({ step: "deploy_hook_trigger", status: "triggered", data: triggerData });
+        console.log(`[DEPLOY] ✅ Hook triggered successfully`);
+      } else {
+        steps.push({ step: "deploy_hook_trigger", status: "warning", http: triggerRes.status, details: triggerData });
+        console.log(`[DEPLOY] ❌ Hook trigger failed: ${triggerRes.status}`);
+      }
     }
   }
 
-  // Trigger il deploy via hook (GET request)
-  if (deployHookUrl) {
-    const triggerRes = await fetch(deployHookUrl);
-    const triggerData = await triggerRes.json().catch(() => ({}));
-    if (triggerData?.job) {
-      steps.push({ step: "deploy_trigger", status: "triggered", jobId: triggerData.job.id });
-    } else {
-      steps.push({ step: "deploy_trigger", status: "warning", http: triggerRes.status, details: triggerData });
-    }
+  if (!deployTriggered) {
+    steps.push({ step: "deploy", status: "no_trigger", message: "Could not trigger deployment via API or hook" });
   }
 
   // Step 4: Wait for deploy to be READY (max 120s)
